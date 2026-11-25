@@ -71,7 +71,8 @@ constexpr void irrevocable_change(
     uint256_t const &base_fee_per_gas, uint64_t const excess_blob_gas,
     BlobSchedule const &blob_schedule)
 {
-    if (tx.to) { // EVM will increment if new contract
+    if (tx.to ||
+        tx.is_batch()) { // A batch consumes its nonce before every entry.
         auto const nonce = state.get_nonce(sender);
         state.set_nonce(sender, nonce + 1);
     }
@@ -235,6 +236,7 @@ template <Traits traits>
 vm::Result ExecuteTransactionNoValidation<traits>::operator()(
     State &state, StateHost<traits> &host)
 {
+    calls_executed_ = 0;
     if constexpr (::monad::is_monad_trait_v<traits>) {
         init_reserve_balance_context<traits>(
             state,
@@ -270,6 +272,78 @@ vm::Result ExecuteTransactionNoValidation<traits>::operator()(
             state.access_storage<traits>(ae.a, keys);
         }
     }
+    if (tx_.calls) {
+        MONAD_ASSERT(!tx_.calls->empty());
+        auto &tracer = host.get_call_tracer();
+        auto root_memory = state.vm().message_memory_ref();
+        auto root =
+            to_message(root_memory, state.vm().message_memory_capacity());
+        root.kind = vm::CallKind::Call;
+        root.recipient = sender_;
+        root.code_address = sender_;
+        root.input_data = nullptr;
+        root.input_size = 0;
+        root.value = {};
+        tracer.on_enter(root);
+
+        // Nonce, fees and transaction-wide initialization precede this journal.
+        state.push();
+        vm::Result result{CallStatus::Success, root.gas};
+        int64_t refund = static_cast<int64_t>(auth_refund);
+        for (auto const &call : *tx_.calls) {
+            auto memory = state.vm().message_memory_ref();
+            auto msg = to_message(memory, state.vm().message_memory_capacity());
+            msg.kind = call.to ? vm::CallKind::Call : vm::CallKind::Create;
+            msg.recipient = call.to.value_or(Address{});
+            msg.code_address = msg.recipient;
+            msg.input_data = call.data.data();
+            msg.input_size = call.data.size();
+            msg.value = store_be_as<bytes32_t>(call.value);
+            msg.gas = result.gas_left;
+            if (call.to) {
+                state.access_account(*call.to);
+                if constexpr (traits::eip_7702_active()) {
+                    if (auto const delegate =
+                            host.resolve_delegation(*call.to)) {
+                        msg.code_address = *delegate;
+                        msg.flags |=
+                            std::to_underlying(vm::CallFlags::Delegated);
+                        state.access_account(*delegate);
+                    }
+                }
+            }
+            ++calls_executed_;
+            result = call.to
+                         ? execute_call_message<traits>(&host, state, msg)
+                         : execute_create_message<traits>(&host, state, msg);
+            if (result.status_code != CallStatus::Success) {
+                break;
+            }
+            refund += result.gas_refund;
+        }
+        if (result.status_code == CallStatus::Success &&
+            revert_transaction<traits>(
+                sender_,
+                tx_,
+                header_.base_fee_per_gas.value_or(0),
+                host.i_,
+                state,
+                host.state_tracer_,
+                host.chain_ctx_)) {
+            result.status_code = CallStatus::ReserveBalanceViolation;
+        }
+        if (result.status_code == CallStatus::Success) {
+            state.pop_accept();
+            result.gas_refund = refund;
+        }
+        else {
+            trace::on_frame_reject(host.state_tracer_, state);
+            state.pop_reject();
+            result.gas_refund = 0;
+        }
+        tracer.on_exit(result);
+        return result;
+    }
     if (MONAD_LIKELY(tx_.to)) {
         state.access_account(*tx_.to);
     }
@@ -287,6 +361,7 @@ vm::Result ExecuteTransactionNoValidation<traits>::operator()(
         }
     }
 
+    calls_executed_ = 1;
     auto result =
         (msg.kind == vm::CallKind::Create || msg.kind == vm::CallKind::Create2)
             ? ::monad::execute_create_message<traits>(&host, state, msg)
@@ -413,7 +488,9 @@ Receipt ExecuteTransaction<traits>::execute_final(
     Receipt receipt{
         .status = result.status_code == CallStatus::Success ? 1u : 0u,
         .gas_used = gas_used,
-        .type = tx_.type};
+        .type = tx_.type,
+        .calls_executed =
+            tx_.type == TransactionType::monad ? this->calls_executed_ : 0u};
     for (auto const &log : state.logs()) {
         receipt.add_log(log);
     }

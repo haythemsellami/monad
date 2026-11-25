@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <span>
+#include <vector>
 
 MONAD_NAMESPACE_BEGIN
 
@@ -59,6 +60,7 @@ protected:
     Address const &sender_;
     std::span<std::optional<Address> const> const authorities_;
     BlockHeader const &header_;
+    uint32_t calls_executed_{};
 
 public:
     ExecuteTransactionNoValidation(
